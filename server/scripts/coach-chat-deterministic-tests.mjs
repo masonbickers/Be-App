@@ -1364,8 +1364,8 @@ assert.equal(
   proteinToSchedulePriority.previousConversationContext.some((message) =>
     /protein|breakfast|lunch|dinner|snacks/i.test(message.content)
   ),
-  false,
-  "previous nutrition topic should be stripped from schedule/timing high-priority context"
+  true,
+  "Retain prior conversation turns while prioritising the latest question"
 );
 
 const scheduleFallback = __coachChatLocalFallbackForTest(
@@ -1428,8 +1428,8 @@ assert.equal(
   nutritionToFormPriority.previousConversationContext.some((message) =>
     /protein|170g/i.test(message.content)
   ),
-  false,
-  "previous nutrition context should be stripped before running-form advice"
+  true,
+  "Retain prior conversation turns while prioritising the latest question"
 );
 
 const weeklyToFatLossPriority = __coachChatLatestPriorityForTest([
@@ -1446,8 +1446,8 @@ assert.equal(
   weeklyToFatLossPriority.previousConversationContext.some((message) =>
     /speed work|long run|sessions/i.test(message.content)
   ),
-  false,
-  "previous weekly-plan context should be stripped before fat-loss answer"
+  true,
+  "Retain prior conversation turns while prioritising the latest question"
 );
 
 const timeToFoodPriority = __coachChatLatestPriorityForTest([
@@ -1464,8 +1464,8 @@ assert.equal(
   timeToFoodPriority.previousConversationContext.some((message) =>
     /30 minutes|mobility|shorter session/i.test(message.content)
   ),
-  false,
-  "previous limited-time context should be stripped before nutrition answer"
+  true,
+  "Retain prior conversation turns while prioritising the latest question"
 );
 
 const memoryToBroadAdvicePriority = __coachChatLatestPriorityForTest([
@@ -1482,8 +1482,8 @@ assert.equal(
   memoryToBroadAdvicePriority.previousConversationContext.some((message) =>
     /remember|saved/i.test(message.content)
   ),
-  false,
-  "previous memory-save turn should not be sent as active background conversation"
+  true,
+  "Retain prior conversation turns while prioritising the latest question"
 );
 
 const speedSafelyPriority = __coachChatLatestPriorityForTest([
