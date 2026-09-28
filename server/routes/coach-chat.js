@@ -1,3 +1,9 @@
+import { Buffer } from 'node:buffer';
+import { createLegacyMemoryBridge } from '../lib/coach/legacyMemoryBridge.js';
+import { legacyMemoryRepositoryForUser } from '../lib/coach/legacyMemoryRepository.js';
+import { selectMemories } from '../lib/coach/memory.js';
+import { recentConversation } from '../lib/coach/context.js';
+import { isInternalCoachReply } from '../../src/lib/chat/coachReply.js';
 // server/routes/coach-chat.js
 import express from "express";
 import {
@@ -2710,27 +2716,13 @@ function latestMentionsMorningTimingTopic(latestUserText) {
   );
 }
 
-function memoryMatchesLatestMessage(memoryText, latestUserText) {
-  const memory = normaliseText(memoryText);
-  if (!memory) return false;
-
-  const isInjuryMemory =
-    /\b(?:knee|hill|hills|injur|pain|sore|soreness|terrain|downhill|uphill)\b/.test(memory);
-  if (isInjuryMemory) return latestMentionsInjuryMemoryTopic(latestUserText);
-
-  const isMorningMemory =
-    /\b(?:morning|time of day|routine|schedule|prefer)\b/.test(memory);
-  if (isMorningMemory) return latestMentionsMorningTimingTopic(latestUserText);
-
-  return false;
-}
-
 function filterCoachMemoryForLatestMessage(memory, latestUserText) {
-  if (!Array.isArray(memory)) return [];
-  return memory.filter((item) => {
-    const text = cleanCoachText(item?.text || item?.category || "");
-    return memoryMatchesLatestMessage(text, latestUserText);
+  const recallRequest = /\b(?:remember|memory|memories)\b|what (?:do you know|did i tell you) about me/i.test(latestUserText);
+  const eligible = (Array.isArray(memory) ? memory : []).filter(item => {
+    const injury = /knee|hill|injur|pain|sore|terrain/i.test(String(item?.text || ''));
+    return !injury || recallRequest || latestMentionsInjuryMemoryTopic(latestUserText);
   });
+  return selectMemories(eligible, latestUserText);
 }
 
 function isCasualMorningPreferenceStatement(text) {
@@ -2767,25 +2759,6 @@ function isReadinessRecoveryPrompt(text) {
     clean.includes("beat up") ||
     clean.includes("sore")
   );
-}
-
-function shouldContinuePreviousTopic(latestUserText) {
-  const clean = normaliseText(latestUserText);
-  if (!clean) return false;
-  return (
-    /\b(?:continue|carry on|same as above|same topic|what about that|what about it|that plan|that meal|that session|that workout|as above)\b/.test(clean) ||
-    /^(?:and|also|what about|how about)\b/.test(clean)
-  );
-}
-
-function intentTopicFamily(intent) {
-  if (isNutritionIntentHint(intent)) return "nutrition";
-  if (["schedule_reschedule", "schedule_timing", "weekly_focus", "limited_time"].includes(intent)) {
-    return "schedule";
-  }
-  if (["general_training_advice", "readiness_recovery"].includes(intent)) return "training";
-  if (intent === "memory_save") return "memory";
-  return "general";
 }
 
 function contextForLatestMessage(context, planSummary = null, latestUserText = "", compact = false) {
@@ -2980,37 +2953,14 @@ function latestUserIntentHint(text) {
   return "general";
 }
 
-function buildRecentConversationContext(trimmedMessages, latestUserText, limit = 8) {
-  const latest = String(latestUserText || "").trim();
-  const latestIntent = latestUserIntentHint(latestUserText);
-  const latestFamily = intentTopicFamily(latestIntent);
-  const continuePrevious = shouldContinuePreviousTopic(latestUserText);
-  const priorMessages = trimmedMessages
-    .filter((message, index) => {
-      if (index === trimmedMessages.length - 1 && message.role === "user") return false;
-      return !(message.role === "user" && String(message.content || "").trim() === latest);
-    })
-    .filter((message) => {
-      if (continuePrevious) return true;
-      const content = String(message?.content || "").trim();
-      if (!content) return false;
-      const messageIntent = latestUserIntentHint(content);
-      const messageFamily = intentTopicFamily(messageIntent);
-
-      if (latestFamily !== "nutrition" && messageFamily === "nutrition") return false;
-      if (latestFamily !== "schedule" && messageFamily === "schedule") return false;
-      if (latestFamily !== "training" && messageFamily === "training") return false;
-      if (messageFamily === "memory") return false;
-
-      return messageFamily === latestFamily && messageFamily !== "general";
-    })
-    .slice(-limit)
-    .map((message) => ({
-      role: message.role,
-      content: message.content,
-    }));
-
-  return priorMessages;
+function buildRecentConversationContext(trimmedMessages, latestUserText, limit = 200) {
+  // Only remove the latest turn itself. Topic filters discarded general facts
+  // and pronoun follow-ups before the model could resolve their meaning.
+  const prior = trimmedMessages.filter((message, index) =>
+    !(index === trimmedMessages.length - 1 && message.role === "user") &&
+    !isInternalCoachReply(message.content)
+  );
+  return recentConversation(prior).slice(-limit);
 }
 
 function contextBoundaryInstruction(latestUserText) {
@@ -3095,10 +3045,10 @@ function latestUserPriorityInstruction(latestUserText) {
   const isNutritionIntent = isNutritionIntentHint(intent);
   const lines = [
     "LATEST_USER_MESSAGE_PRIORITY:",
-    "- HARD RULE: Answer only the latest user message. Do not continue a previous topic unless the latest message explicitly asks to continue it.",
+    "- HARD RULE: Answer the latest user message, using earlier turns to resolve follow-ups, references and remembered decisions.",
     "- Answer the latest user message directly.",
-    "- Conversation history is background context only; it must not override the latest ask.",
-    "- Do not continue a previous topic unless the latest user message clearly asks to continue it.",
+    "- Preserve facts and decisions from conversation history while giving the latest ask priority.",
+    "- Short follow-ups and pronouns may refer to earlier turns without repeating the topic.",
     "- Answer the latest user intent. Do not reuse the format, topic, or recommendation from the previous assistant reply unless the latest message asks for a follow-up.",
     `- Latest user intent hint: ${intent}.`,
     "- Saved memory relevance rule: knee/hill soreness memory may only influence prompts about knees, hills, injury, pain/soreness, running terrain, uphill/downhill work, or running injury risk.",
@@ -3267,7 +3217,7 @@ function buildCoachChatMessages({
   const planForModel = planForLatestMessage(plan, planSummary, latestUserText, compact);
   const contextLimit = compact ? 5500 : 14000;
   const planLimit = compact ? 4500 : 18000;
-  const messageLimit = compact ? 8 : 20;
+  const messageLimit = 200;
   const recentContext = buildRecentConversationContext(
     trimmedMessages,
     latestUserText,
@@ -3292,16 +3242,6 @@ function buildCoachChatMessages({
       role: "system",
       content: "CURRENT_PLAN_JSON:\n" + safeStringify(planForModel, planLimit),
     },
-    ...(recentContext.length
-      ? [
-          {
-            role: "system",
-            content:
-              "RECENT_CONVERSATION_CONTEXT_FOR_BACKGROUND_ONLY:\n" +
-              safeStringify(recentContext, compact ? 3500 : 7000),
-          },
-        ]
-      : []),
     {
       role: "system",
       content: contextBoundaryInstruction(latestUserText),
@@ -3313,8 +3253,9 @@ function buildCoachChatMessages({
     {
       role: "system",
       content:
-        "FINAL_LATEST_MESSAGE_RULE: Answer only the latest user message below. Do not continue any previous topic unless the latest message explicitly asks to continue it.",
+        "FINAL_LATEST_MESSAGE_RULE: Answer the latest user message below. Resolve follow-ups using earlier turns; when the topic changes, answer the new topic.",
     },
+    ...recentContext,
     {
       role: "user",
       content: latestUserText,
@@ -3365,42 +3306,9 @@ async function createCoachChatResponsesFetchFallback({
     true
   );
   const compactPlan = compactPlanForCoach(plan, planSummary);
-  const payload = {
-    context: compactContext,
-    liveContextFacts,
-    currentPlan: compactPlan,
-    latestUserMessage: latestUserText,
-    latestUserIntentHint: latestUserIntentHint(latestUserText),
-    previousConversationContext: buildRecentConversationContext(
-      trimmedMessages,
-      latestUserText,
-      8
-    ),
-  };
   const requestBody = {
     model,
-    input: [
-      {
-        role: "system",
-        content: [
-          {
-            type: "input_text",
-            text: `${systemPrompt}\n\n${contextBoundaryInstruction(latestUserText)}\n\n${latestUserPriorityInstruction(latestUserText)}\n\nFINAL_LATEST_MESSAGE_RULE: Answer only the latest user message. Do not continue any previous topic unless the latest message explicitly asks to continue it.\n\nReturn valid JSON only with keys reply, updatedPlan, nutritionDraft, and coachActions.`,
-          },
-        ],
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text:
-              "Use this compact coach-chat payload to answer the latest user message:\n" +
-              safeStringify(payload, 12000),
-          },
-        ],
-      },
-    ],
+    input: buildCoachChatMessages({systemPrompt,mergedContext,liveContextFacts,plan,planSummary,trimmedMessages,compact:true}),
   };
 
   console.info("[coach-chat] OpenAI direct responses request", {
@@ -4166,7 +4074,7 @@ function fallbackMessageFromRequestBody(body) {
         typeof message?.content === "string" &&
         message.content.trim()
     )
-    .slice(-30)
+    .slice(-200)
     .map((message) => ({
       role: message.role,
       content: String(message.content || "").trim(),
@@ -4228,8 +4136,9 @@ function extractJsonObject(raw = "") {
  *   raw: string
  * }
  */
-export default function coachChatRoute(openai) {
+export default function coachChatRoute(openai, {getRepository=legacyMemoryRepositoryForUser}={}) {
   const router = express.Router();
+  router.use(createLegacyMemoryBridge({getRepository}));
   const coachChatModel = OPENAI_COACH_CHAT_MODEL;
 
   if (!openai) {
@@ -4253,7 +4162,7 @@ export default function coachChatRoute(openai) {
             typeof m?.content === "string" &&
             (m.content.trim() || Array.isArray(m?.attachments))
         )
-        .slice(-30)
+        .slice(-200)
         .map((m) => ({
           role: m.role,
           content: String(m.content || "").trim(),
