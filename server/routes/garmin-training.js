@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import express from "express";
 
 import admin from "../admin.js";
@@ -635,7 +636,7 @@ router.post("/send-workout", requireUser, async (req, res) => {
         .collection("sessionLogs")
         .doc(sessionKey)
         .get();
-      existingSessionLog = existingSessionLogSnap.exists()
+      existingSessionLog = existingSessionLogSnap.exists
         ? existingSessionLogSnap.data() || {}
         : null;
     }
@@ -776,7 +777,7 @@ router.post("/send-workout", requireUser, async (req, res) => {
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
 
-        if (!existingSessionLogSnap.exists()) {
+        if (!existingSessionLogSnap.exists) {
           sessionLogPatch.createdAt = admin.firestore.FieldValue.serverTimestamp();
         }
 
