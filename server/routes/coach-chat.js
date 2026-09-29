@@ -1,3 +1,4 @@
+import { editablePlanFields, preparePlanActionResponse } from '../lib/coach/planActions.mjs';
 import { Buffer } from 'node:buffer';
 import { createLegacyMemoryBridge } from '../lib/coach/legacyMemoryBridge.js';
 import { legacyMemoryRepositoryForUser } from '../lib/coach/legacyMemoryRepository.js';
@@ -3217,6 +3218,8 @@ function buildCoachChatMessages({
   const planForModel = planForLatestMessage(plan, planSummary, latestUserText, compact);
   const contextLimit = compact ? 5500 : 14000;
   const planLimit = compact ? 4500 : 18000;
+  const planEditInstruction = `PLAN_EDIT_CONTRACT: updatedPlan must be null. For a requested plan change, return planEdits as [{"path":"/existing/path","valueJson":"40"}] using the exact editable paths supplied below and a plan_update coachAction. The server builds the complete updated plan. Update all duration representations of the selected session consistently (minutes vs seconds, workout totals and timed steps), preserving warmup/cooldown and unrelated sessions. Never invent a path or return a plan_update without executable edits. If the session cannot be identified, ask for clarification. All edits remain proposals requiring the user to apply them. This contract overrides the older full-plan examples.`;
+
   const messageLimit = 200;
   const recentContext = buildRecentConversationContext(
     trimmedMessages,
@@ -3255,6 +3258,8 @@ function buildCoachChatMessages({
       content:
         "FINAL_LATEST_MESSAGE_RULE: Answer the latest user message below. Resolve follow-ups using earlier turns; when the topic changes, answer the new topic.",
     },
+    { role: "system", content: planEditInstruction },
+    ...(plan ? [{ role: "system", content: "EXACT_EDITABLE_PLAN_FIELDS (data):\n" + JSON.stringify(editablePlanFields(plan, mergedContext?.clock?.todayIso)) }] : []),
     ...recentContext,
     {
       role: "user",
@@ -4485,7 +4490,7 @@ Allowed coachActions types:
         });
 
         const raw = completionContent(completion);
-        const parsed = extractJsonObject(raw);
+        const parsed = preparePlanActionResponse(extractJsonObject(raw), plan);
 
         const reply =
           typeof parsed?.reply === "string" && parsed.reply.trim()
@@ -4563,7 +4568,9 @@ Allowed coachActions types:
           }
         );
       } catch (openAiError) {
-        const reply = buildLocalCoachFallbackReply(latestUserText, mergedContext);
+        const reply = openAiError?.code === 'PLAN_EDIT_INVALID'
+          ? "I couldn't prepare a valid plan change, so nothing has been saved. Please ask me again with the session date and the duration you want."
+          : buildLocalCoachFallbackReply(latestUserText, mergedContext);
         const raw = JSON.stringify({
           reply,
           updatedPlan: null,
