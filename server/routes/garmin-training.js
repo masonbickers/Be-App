@@ -507,13 +507,14 @@ async function loadGarminIntegration(uid) {
   const snap = await admin.firestore().collection("users").doc(String(uid)).get();
   if (!snap.exists) return null;
   const integrations = snap.data()?.integrations || {};
-  return integrations.garminTraining || integrations.garmin || null;
+  const key = integrations.garminTraining ? "garminTraining" : "garmin";
+  return integrations[key] ? { key, integration: integrations[key] } : null;
 }
 
-async function saveGarminIntegration(uid, integration) {
+async function saveGarminIntegration(uid, integrationKey, integration) {
   await admin.firestore().collection("users").doc(String(uid)).set(
     {
-      integrations: { garminTraining: integration },
+      integrations: { [integrationKey]: integration },
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true }
@@ -526,75 +527,81 @@ function safeSnippet(text, max = 400) {
   return raw.slice(0, max);
 }
 
-async function refreshAccessTokenIfNeeded(uid, garmin) {
-  if (!garmin) return { ok: false, error: "No Garmin integration" };
+const GARMIN_RECONNECT_ERROR = "Reconnect Training sync in Settings → Garmin, then send this workout again.";
 
+async function requireGarminReconnect(uid, integrationKey, garmin) {
+  const db = admin.firestore();
+  const ref = db.collection("users").doc(String(uid));
+  const marked = await db.runTransaction(async transaction => {
+    const snap = await transaction.get(ref);
+    const current = snap.data()?.integrations?.[integrationKey];
+    // A concurrent reconnect/refresh must not be disabled by an older request.
+    if (!current || current.refreshToken !== garmin.refreshToken || current.accessToken !== garmin.accessToken) return false;
+    transaction.set(ref, {
+      integrations: { [integrationKey]: { connected: false, reconnectRequired: true, connectionError: "GARMIN_RECONNECT_REQUIRED" } },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return true;
+  });
+  return marked
+    ? { ok: false, httpStatus: 401, code: "GARMIN_RECONNECT_REQUIRED", error: GARMIN_RECONNECT_ERROR }
+    : { ok: false, httpStatus: 409, code: "GARMIN_CONNECTION_CHANGED", error: "Your Garmin connection changed. Try sending this workout again." };
+}
+
+async function refreshAccessTokenIfNeeded(uid, integrationKey, garmin) {
+  if (!garmin) return { ok: false, error: "No Garmin integration" };
   const accessToken = String(garmin.accessToken || "").trim();
   const refreshToken = String(garmin.refreshToken || "").trim();
   const expiresAtMs = Number(garmin.expiresAtMs || 0);
-
   if (!accessToken) return { ok: false, error: "Missing Garmin access token" };
-
   const now = Date.now();
-  const isExpired = expiresAtMs && now > expiresAtMs;
-  if (!isExpired) return { ok: true, accessToken };
+  if (!expiresAtMs || now < expiresAtMs) return { ok: true, accessToken };
 
-  if (!refreshToken) {
-    return { ok: false, error: "Garmin access token expired and no refresh token is stored" };
+  const refreshLifetime = Number(garmin.refreshTokenExpiresIn || 0);
+  const refreshIssuedAt = Math.max(Number(garmin.linkedAtMs || 0), Number(garmin.refreshedAtMs || 0));
+  const refreshExpiresAt = Number(garmin.refreshTokenExpiresAtMs || 0)
+    || (refreshLifetime > 0 && refreshIssuedAt > 0 ? refreshIssuedAt + refreshLifetime * 1000 : 0);
+  if (!refreshToken || (refreshExpiresAt > 0 && now >= refreshExpiresAt)) {
+    return requireGarminReconnect(uid, integrationKey, garmin);
   }
 
-  const clientId = String(
-    process.env.GARMIN_TRAINING_CLIENT_ID || process.env.GARMIN_CLIENT_ID || ""
-  ).trim();
-  const clientSecret = String(
-    process.env.GARMIN_TRAINING_CLIENT_SECRET ||
-      process.env.GARMIN_CLIENT_SECRET ||
-      ""
-  ).trim();
+  // Refresh with the client that issued this grant, including legacy connections.
+  const profile = garmin.credentialProfile || (integrationKey === "garminTraining" ? "training" : "default");
+  const prefix = profile === "training" ? "GARMIN_TRAINING" : profile === "health" ? "GARMIN_HEALTH" : "GARMIN";
+  const clientId = String(process.env[`${prefix}_CLIENT_ID`] || process.env.GARMIN_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env[`${prefix}_CLIENT_SECRET`] || process.env.GARMIN_CLIENT_SECRET || "").trim();
   if (!clientId || !clientSecret) {
-    return {
-      ok: false,
-      error:
-        "Missing GARMIN_TRAINING_CLIENT_ID/GARMIN_CLIENT_ID or GARMIN_TRAINING_CLIENT_SECRET/GARMIN_CLIENT_SECRET",
-    };
+    return { ok: false, httpStatus: 503, code: "GARMIN_TOKEN_REFRESH_FAILED", error: "Garmin connection renewal is unavailable. Please try again later." };
   }
-
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: clientId,
-    client_secret: clientSecret,
-    refresh_token: refreshToken,
-  }).toString();
-
   const resp = await fetch(TOKEN_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken }).toString(),
+    signal: AbortSignal.timeout(15000),
   });
-
   const tokenJson = await resp.json().catch(() => ({}));
   if (!resp.ok || !tokenJson?.access_token) {
-    return {
-      ok: false,
-      error: "Garmin token refresh failed",
-      status: resp.status,
-      details: tokenJson,
-    };
+    // Garmin's error_description can contain the refresh token. Never return/log it.
+    const invalidGrant = tokenJson.error === "invalid_grant";
+    console.warn("[garmin/token-refresh]", { status: resp.status, profile, invalidGrant });
+    if (invalidGrant) return requireGarminReconnect(uid, integrationKey, garmin);
+    return { ok: false, httpStatus: 503, code: "GARMIN_TOKEN_REFRESH_FAILED", error: "Garmin connection renewal failed. Please try again later.", status: resp.status };
   }
-
   const expiresInSec = Number(tokenJson.expires_in || 0);
+  const newRefreshLifetime = Number(tokenJson.refresh_token_expires_in || 0);
   const updated = {
-    ...garmin,
-    accessToken: tokenJson.access_token,
+    ...garmin, accessToken: tokenJson.access_token,
     refreshToken: tokenJson.refresh_token || refreshToken,
     tokenType: tokenJson.token_type || garmin.tokenType || "bearer",
     scope: tokenJson.scope || garmin.scope || null,
     expiresAtMs: now + Math.max(0, expiresInSec - 600) * 1000,
-    refreshedAtMs: now,
-    tokenEndpoint: TOKEN_ENDPOINT,
+    refreshedAtMs: now, tokenEndpoint: TOKEN_ENDPOINT,
+    connected: true, reconnectRequired: false, connectionError: null,
+    ...(newRefreshLifetime > 0 ? {
+      refreshTokenExpiresIn: newRefreshLifetime,
+      refreshTokenExpiresAtMs: now + newRefreshLifetime * 1000,
+    } : {}),
   };
-
-  await saveGarminIntegration(uid, updated);
+  await saveGarminIntegration(uid, integrationKey, updated);
   return { ok: true, accessToken: updated.accessToken, refreshed: true };
 }
 
@@ -659,7 +666,11 @@ router.post("/send-workout", requireUser, async (req, res) => {
       });
     }
 
-    const garmin = await loadGarminIntegration(uid);
+    const entry = await loadGarminIntegration(uid);
+    const garmin = entry?.integration;
+    if (garmin?.reconnectRequired) {
+      return res.status(401).json({ ok: false, code: "GARMIN_RECONNECT_REQUIRED", error: GARMIN_RECONNECT_ERROR });
+    }
     if (!garmin?.connected || !garmin?.accessToken) {
       return res.status(409).json({
         ok: false,
@@ -667,10 +678,11 @@ router.post("/send-workout", requireUser, async (req, res) => {
       });
     }
 
-    const tokenResult = await refreshAccessTokenIfNeeded(uid, garmin);
+    const tokenResult = await refreshAccessTokenIfNeeded(uid, entry.key, garmin);
     if (!tokenResult.ok) {
-      return res.status(401).json({
+      return res.status(tokenResult.httpStatus || 401).json({
         ok: false,
+        code: tokenResult.code,
         error: tokenResult.error,
         status: tokenResult.status || 401,
         details: tokenResult.details || null,
