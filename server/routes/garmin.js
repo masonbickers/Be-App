@@ -464,6 +464,8 @@ router.get("/callback", async (req, res) => {
 
     await saveGarminIntegration(stateData.uid, {
       connected: true,
+      reconnectRequired: false,
+      connectionError: null,
       garminUserId,
       accessToken: tokenJson.access_token,
       refreshToken: tokenJson.refresh_token,
@@ -471,6 +473,8 @@ router.get("/callback", async (req, res) => {
       tokenType: tokenJson.token_type || "bearer",
       expiresAtMs,
       refreshTokenExpiresIn: tokenJson.refresh_token_expires_in || null,
+      refreshTokenExpiresAtMs: Number(tokenJson.refresh_token_expires_in) > 0
+        ? now + Number(tokenJson.refresh_token_expires_in) * 1000 : null,
       credentialProfile: oauthConfig.profile,
       apiProduct: oauthConfig.profile,
       linkedAtMs: now,
