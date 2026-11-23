@@ -5,8 +5,6 @@ import {
   searchFoodsCached,
 } from "../lib/nutrition/foodCatalogCache.js";
 
-const router = express.Router();
-
 /* ----------------------------------------------------------------------------
    Helpers
 ---------------------------------------------------------------------------- */
@@ -472,7 +470,8 @@ function fallbackFuelMatch({ goal, totals, meals, sessions, nowLocalISO }) {
    Factory – inject OpenAI instance from index.js
 ---------------------------------------------------------------------------- */
 
-export default function createNutritionRoutes(openai) {
+export default function createNutritionRoutes(openai, { fetchProduct = fetch, barcodeTimeoutMs = 8000 } = {}) {
+  const router = express.Router();
   // ---------------------------------------------------------------------------
   // /nutrition/search — unified global food search (deterministic providers)
   // ---------------------------------------------------------------------------
@@ -1259,9 +1258,9 @@ Return STRICT JSON:
       const url = `https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(
         barcode
       )}.json`;
-      const response = await fetch(url);
+      const response = await fetchProduct(url, { signal: AbortSignal.timeout(barcodeTimeoutMs) });
       if (!response.ok) {
-        return res.status(502).json({ error: "Barcode provider unavailable" });
+        return res.status(503).json({ code: 'BARCODE_PROVIDER_UNAVAILABLE', error: 'Barcode lookup is unavailable. Enter this food manually.' });
       }
 
       const data = await response.json();
@@ -1271,33 +1270,50 @@ Return STRICT JSON:
       }
 
       const toNum = (v) => {
-        const n = Number(String(v ?? "").replace(",", "."));
-        return Number.isFinite(n) ? n : 0;
+        if (v == null || String(v).trim() === '') return NaN;
+        const n = Number(String(v).replace(",", "."));
+        return Number.isFinite(n) && n >= 0 ? n : NaN;
       };
-      const round = (n) => Math.round(toNum(n));
+      const round = (n) => Math.round(n * 10) / 10;
 
       const n = product?.nutriments || {};
 
       const per100g = {
-        calories: round(n["energy-kcal_100g"] ?? n.energy_kcal_100g),
-        protein: round(n["proteins_100g"] ?? n.proteins_100g),
-        carbs: round(n["carbohydrates_100g"] ?? n.carbohydrates_100g),
-        fat: round(n["fat_100g"] ?? n.fat_100g),
+        calories: toNum(n["energy-kcal_100g"] ?? n.energy_kcal_100g),
+        protein: toNum(n["proteins_100g"] ?? n.proteins_100g),
+        carbs: toNum(n["carbohydrates_100g"] ?? n.carbohydrates_100g),
+        fat: toNum(n["fat_100g"] ?? n.fat_100g),
       };
 
+      if (Object.values(per100g).some(value => !Number.isFinite(value)) ||
+        per100g.calories > 950 || per100g.protein + per100g.carbs + per100g.fat > 115) {
+        return res.status(422).json({ code: 'NUTRITION_LABEL_INCOMPLETE', error: 'This barcode has incomplete nutrition information. Enter the label manually.' });
+      }
+
       const servingRaw = String(product?.serving_size || "").trim();
-      const servingMatch = servingRaw.match(/(\d+(?:[.,]\d+)?)/);
+      const servingMatch = servingRaw.match(/(\d+(?:[.,]\d+)?)\s*(g|ml)\b/i);
+      const directServing = {
+        calories: toNum(n['energy-kcal_serving'] ?? n.energy_kcal_serving),
+        protein: toNum(n.proteins_serving),
+        carbs: toNum(n.carbohydrates_serving),
+        fat: toNum(n.fat_serving),
+      };
+      const directComplete = Object.values(directServing).every(Number.isFinite);
+      const servingUnit = servingMatch?.[2]?.toLowerCase() || 'g';
+      if (servingUnit === 'ml' && !directComplete) {
+        return res.status(422).json({ code: 'NUTRITION_SERVING_UNCLEAR', error: 'This liquid serving cannot be verified from per-100g values. Enter the label manually.' });
+      }
       const servingSizeG = servingMatch ? toNum(servingMatch[1]) : 0;
       const servingSize = servingSizeG > 0 ? servingSizeG : 100;
-      const servingUnit = servingSizeG > 0 ? "g" : "serving";
       const factor = servingSizeG > 0 ? servingSizeG / 100 : 1;
 
-      const perServing = {
-        calories: round(per100g.calories * factor),
+      const scaledServing = {
+        calories: Math.round(per100g.calories * factor),
         protein: round(per100g.protein * factor),
         carbs: round(per100g.carbs * factor),
         fat: round(per100g.fat * factor),
       };
+      const perServing = directComplete ? { ...directServing, calories: Math.round(directServing.calories) } : scaledServing;
 
       return res.json({
         title:
@@ -1310,16 +1326,14 @@ Return STRICT JSON:
         servingSize,
         servingUnit,
         macrosPerServing: perServing,
-        macrosPer100g: per100g,
+        macrosPer100g: { ...per100g, calories: Math.round(per100g.calories) },
+        nutritionComplete: true,
         source: "openfoodfacts",
         barcode,
       });
     } catch (err) {
-      console.error("[nutrition/barcode-lookup] error", err);
-      return res.status(500).json({
-        error: "Failed to look up barcode",
-        detail: err?.message,
-      });
+      console.warn("[nutrition/barcode-lookup] unavailable", err?.name || err?.code || 'error');
+      return res.status(503).json({ code: 'BARCODE_PROVIDER_UNAVAILABLE', error: 'Barcode lookup is unavailable. Enter this food manually.' });
     }
   });
 
